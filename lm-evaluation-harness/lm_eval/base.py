@@ -119,6 +119,13 @@ class LM(abc.ABC):
 
 
 class BaseLM(LM):
+    def __init__(self):
+        super().__init__()
+        self.batch_schedule = 1
+        self.batch_sizes = {}
+        self.max_batch_size = 512
+        self.prompt = ""
+
     @property
     @abstractmethod
     def eot_token_id(self):
@@ -167,39 +174,69 @@ class BaseLM(LM):
         """
         pass
 
+    def _detect_batch_size(self, requests=None, pos=0):
+        if requests:
+            _, context_enc, continuation_enc = requests[pos]
+            max_length = len(
+                (context_enc + continuation_enc)[-(self.max_length + 1) :][:-1]
+            )
+        else:
+            max_length = self.max_length
+
+        # if OOM, then halves batch_size and tries again
+        @find_executable_batch_size(starting_batch_size=self.max_batch_size)
+        def forward_batch(batch_size):
+            test_batch = torch.ones((batch_size, max_length), device=self.device).long()
+            for _ in range(5):
+                _ = F.log_softmax(self._model_call(test_batch), dim=-1).cpu()
+            return batch_size
+
+        batch_size = forward_batch()
+        utils.clear_torch_cache()
+
+        return batch_size
+
     # subclass must implement properties vocab_size, eot_token_id, max_gen_toks, batch_size, device, max_length.
     # TODO: enforce this somehow
 
+    def _encode_pair(self, context, continuation):
+        n_spaces = len(context) - len(context.rstrip())
+        if n_spaces > 0:
+            continuation = context[-n_spaces:] + continuation
+            context = context[:-n_spaces]
+        whole_enc = self.tok_encode(context + continuation)
+        context_enc = self.tok_encode(context)
+        context_enc_len = len(context_enc)
+        continuation_enc = whole_enc[context_enc_len:]
+        return context_enc, continuation_enc
+
     def loglikelihood(self, requests):
+        # import pdb; pdb.set_trace()
         new_reqs = []
         for context, continuation in requests:
             if context == "":
                 # end of text as context
-                context_enc = [self.eot_token_id]
+                context_enc, continuation_enc = [self.eot_token_id], self.tok_encode(
+                    continuation
+                )
             else:
-                context_enc = self.tok_encode(context)
-
-            continuation_enc = self.tok_encode(continuation)
+                context_enc, continuation_enc = self._encode_pair(context, continuation)
 
             new_reqs.append(((context, continuation), context_enc, continuation_enc))
+
         return self._loglikelihood_tokens(new_reqs)
 
     def loglikelihood_rolling(self, requests):
-        # TODO: Implement caching once we've confirmed the perplexity implementation
+        # import pdb; pdb.set_trace()
         
+        # TODO: Implement caching once we've confirmed the perplexity implementation
+
         # automatic batch size detection for vectorization
         adaptive_batch_size = None
-        if self.batch_size == 'auto': 
+        if self.batch_size == "auto":
             # using rolling window with maximum context
-            print('Passed argument batch_size = auto. Detecting largest batch size')
-            @find_executable_batch_size(starting_batch_size=512) # if OOM, then halves batch_size and tries again
-            def forward_batch(batch_size):
-                test_batch = torch.ones((batch_size, self.max_length), device=self.device).long()
-                for _ in range(5): 
-                    out = F.log_softmax(self._model_call(test_batch), dim = -1).cpu()
-                return batch_size
-            
-            batch_size = forward_batch() 
+            print("Passed argument batch_size = auto. Detecting largest batch size")
+            batch_size = self._detect_batch_size()
             print(f"Determined Largest batch size: {batch_size}")
             adaptive_batch_size = batch_size
 
@@ -222,7 +259,9 @@ class BaseLM(LM):
             # TODO: extract out this call so it only gets called once and also somehow figure out partial caching for
             # that
             string_nll = self._loglikelihood_tokens(
-                rolling_token_windows, disable_tqdm=True, override_bs = adaptive_batch_size
+                rolling_token_windows,
+                disable_tqdm=True,
+                override_bs=adaptive_batch_size,
             )
 
             # discard is_greedy
@@ -233,10 +272,12 @@ class BaseLM(LM):
 
         return loglikelihoods
 
-    def _loglikelihood_tokens(self, requests, disable_tqdm=False, override_bs = None):
+    def _loglikelihood_tokens(self, requests, disable_tqdm=False, override_bs=None):
+        # import pdb; pdb.set_trace()
+        
         # TODO: implement some kind of efficient-request-middleware that lumps together requests with the same context
         res = []
-        
+
         def _collate(x):
             # the negative sign on len(toks) sorts descending - this has a few advantages:
             # - time estimates will always be over not underestimates, which is more useful for planning
@@ -250,30 +291,32 @@ class BaseLM(LM):
 
         re_ord = utils.Reorderer(requests, _collate)
 
+        reordered_requests = re_ord.get_reordered()
+        n_reordered_requests = len(reordered_requests)
+
         # automatic (variable) batch size detection for vectorization
         # pull longest context sample from request
-        _, context_enc, continuation_enc = re_ord.get_reordered()[0]
-        max_context = len((context_enc + continuation_enc)[-(self.max_length + 1) :][:-1])
-        if (self.batch_size == 'auto'):
-            
-            if override_bs is None:
-                print('Passed argument batch_size = auto. Detecting largest batch size')
-                @find_executable_batch_size(starting_batch_size=512) # if OOM, then halves batch_size and tries again
-                def forward_batch(batch_size):
-                    test_batch = torch.ones((batch_size, max_context), device=self.device).long()
-                    for _ in range(5): 
-                        out = F.log_softmax(self._model_call(test_batch), dim = -1).cpu()
-                    return batch_size
-                
-                batch_size = forward_batch() 
-                print(f"Determined largest batch size: {batch_size}")
-                adaptive_batch_size = batch_size
-                
-            else:
-                adaptive_batch_size = override_bs
+        def _batch_scheduler(pos):
+            sched = pos // int(n_reordered_requests / self.batch_schedule)
+            if sched in self.batch_sizes:
+                return self.batch_sizes[sched]
+            print(
+                f"Passed argument batch_size = auto:{self.batch_schedule}. Detecting largest batch size"
+            )
+            self.batch_sizes[sched] = self._detect_batch_size(reordered_requests, pos)
+            print(f"Determined largest batch size: {self.batch_sizes[sched]}")
+            return self.batch_sizes[sched]
 
         for chunk in utils.chunks(
-            tqdm(re_ord.get_reordered(), disable=disable_tqdm), self.batch_size if self.batch_size != "auto" else adaptive_batch_size
+            tqdm(reordered_requests, disable=disable_tqdm),
+            n=self.batch_size
+            if self.batch_size != "auto"
+            else override_bs
+            if override_bs is not None
+            else 0,
+            fn=_batch_scheduler
+            if self.batch_size == "auto" and n_reordered_requests > 0 and not override_bs
+            else None,
         ):
             inps = []
             cont_toks_list = []
@@ -327,7 +370,7 @@ class BaseLM(LM):
                 cont_toks_list.append(cont)
                 inplens.append(inplen)
 
-            batched_inps = torch.cat(inps, dim=0)  # [batch, padding_length
+            batched_inps = torch.cat(inps, dim=0)  # [batch, padding_length]
             multi_logits = F.log_softmax(
                 self._model_call(batched_inps), dim=-1
             ).cpu()  # [batch, padding_length, vocab]
@@ -338,6 +381,7 @@ class BaseLM(LM):
 
                 # Slice to original seq length
                 contlen = len(cont_toks)
+                inplen = inplen + (logits.shape[0] - padding_length) # if "virtual tokens" (from prompt tuning) are added, inplen is larger
                 logits = logits[inplen - contlen : inplen].unsqueeze(
                     0
                 )  # [1, seq, vocab]
@@ -367,6 +411,8 @@ class BaseLM(LM):
         return re_ord.get_original(res)
 
     def greedy_until(self, requests):
+        # import pdb; pdb.set_trace()
+        
         # TODO: implement fully general `until` that handles until that are
         #       multiple tokens or that span multiple tokens correctly
 
@@ -374,27 +420,43 @@ class BaseLM(LM):
         res = []
 
         def _collate(x):
+            # the negative sign on len(toks) sorts descending - this has a few advantages:
+            # - time estimates will always be over not underestimates, which is more useful for planning
+            # - to know the size of a batch when going through the list, you know the first one is always the batch
+            #   padded context length. this is useful to simplify the batching logic and more importantly to make
+            #   automatic adaptive batches much much easier to implement
+            # - any OOMs will happen right away rather than near the end
+
             toks = self.tok_encode(x[0])
-            return len(toks), x[0]
+            return -len(toks), x[0]
 
         re_ord = utils.Reorderer(requests, _collate)
 
+        warn_stop_seq = False
         for context, request_args in tqdm(re_ord.get_reordered()):
-            until = request_args['until']
+            until = request_args["until"]
             if isinstance(until, str):
                 until = [until]
 
             if until:
-                (primary_until,) = self.tok_encode(until[0])
+                try:
+                    (primary_until,) = self.tok_encode(until[0])
+                except ValueError:
+                    if not warn_stop_seq:
+                        print(
+                            "Warning: a primary stop sequence is multi-token! Will default to EOS token for this tokenizer. Consider using `hf-causal-experimental` for multi-token stop sequence support for the time being."
+                        )
+                        warn_stop_seq = True
+                    primary_until = self.eot_token_id
             else:
                 primary_until = None
 
             context_enc = torch.tensor(
-                [self.tok_encode(context)[self.max_gen_toks - self.max_length :]]
+                [self.tok_encode(self.prompt + context)[self.max_gen_toks - self.max_length :]]
             ).to(self.device)
 
             max_gen_tokens = min(
-                self.max_gen_toks, request_args.get('max_length', self.max_gen_toks)
+                self.max_gen_toks, request_args.get("max_length", self.max_gen_toks)
             )
             cont = self._model_generate(
                 context_enc, context_enc.shape[1] + max_gen_tokens, primary_until
@@ -482,13 +544,19 @@ class Task(abc.ABC):
             - `datasets.DownloadMode.FORCE_REDOWNLOAD`
                 Fresh download and fresh dataset.
         """
-        self.dataset = datasets.load_dataset(
-            path=self.DATASET_PATH,
-            name=self.DATASET_NAME,
-            data_dir=data_dir,
-            cache_dir=cache_dir,
-            download_mode=download_mode,
-        )
+        if data_dir is None:
+            self.dataset = datasets.load_dataset(
+                path=self.DATASET_PATH,
+                name=self.DATASET_NAME,
+                data_dir=data_dir,
+                cache_dir=cache_dir,
+                download_mode=download_mode,
+            )
+        else:
+            self.dataset = datasets.load_dataset(
+                data_dir,
+                streaming = False,
+            )
 
     def should_decontaminate(self):
         """Whether this task supports decontamination against model training set."""
@@ -691,6 +759,7 @@ class MultipleChoiceTask(Task):
         return " " + doc["choices"][doc["gold"]]
 
     def construct_requests(self, doc, ctx):
+        # import pdb; pdb.set_trace()
         lls = [
             rf.loglikelihood(ctx, " {}".format(choice))[0] for choice in doc["choices"]
         ]
@@ -843,6 +912,10 @@ class CachingLM:
         lm.set_cache_hook(self.get_cache_hook())
 
     def __getattr__(self, attr):
+        lm_attr = getattr(self.lm, attr)
+        if not callable(lm_attr):
+            return lm_attr
+
         def fn(requests):
             res = []
             remaining_reqs = []

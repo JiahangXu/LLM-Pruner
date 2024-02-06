@@ -67,10 +67,10 @@ class StoryCloze(Task):
     def doc_to_text(self, doc):
         return " ".join(
             [
-                doc["input_sentence_1"],
-                doc["input_sentence_2"],
-                doc["input_sentence_3"],
-                doc["input_sentence_4"],
+                doc["InputSentence1"],
+                doc["InputSentence2"],
+                doc["InputSentence3"],
+                doc["InputSentence4"],
             ]
         )
 
@@ -80,17 +80,17 @@ class StoryCloze(Task):
     def doc_to_decontamination_query(self, doc):
         return " ".join(
             [
-                doc["input_sentence_1"],
-                doc["input_sentence_2"],
-                doc["input_sentence_3"],
-                doc["input_sentence_4"],
+                doc["InputSentence1"],
+                doc["InputSentence2"],
+                doc["InputSentence3"],
+                doc["InputSentence4"],
             ]
         )
 
     def doc_to_target(self, doc):
-        clozes = [doc["sentence_quiz1"], doc["sentence_quiz2"]]
+        clozes = [doc["RandomFifthSentenceQuiz1"], doc["RandomFifthSentenceQuiz2"]]
         # `- 1` because the `answer_right_ending` index is 1-based.
-        return " " + clozes[doc["answer_right_ending"] - 1]
+        return " " + clozes[doc["AnswerRightEnding"] - 1]
 
     def construct_requests(self, doc, ctx):
         """Uses RequestFactory to construct Requests and returns an iterable of
@@ -103,7 +103,7 @@ class StoryCloze(Task):
             language description, as well as the few shot examples, and the question
             part of the document for `doc`.
         """
-        clozes = [doc["sentence_quiz1"], doc["sentence_quiz2"]]
+        clozes = [doc["RandomFifthSentenceQuiz1"], doc["RandomFifthSentenceQuiz2"]]
         lls = [rf.loglikelihood(ctx, " {}".format(choice))[0] for choice in clozes]
         return lls
 
@@ -117,7 +117,7 @@ class StoryCloze(Task):
         :param results:
             The results of the requests created in construct_requests.
         """
-        gold = doc["answer_right_ending"] - 1
+        gold = doc["AnswerRightEnding"] - 1
         acc = 1.0 if np.argmax(results) == gold else 0.0
         return {"acc": acc}
 

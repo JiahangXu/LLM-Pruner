@@ -107,7 +107,7 @@ class SQuAD2(Task):
             language description, as well as the few shot examples, and the question
             part of the document for `doc`.
         """
-        continuation = rf.greedy_until(ctx, {'until': ["\n"]})
+        continuation = rf.greedy_until(ctx, {"until": ["\n"]})
         is_unanswerable = rf.loglikelihood(ctx, " " + "unanswerable")
         return continuation, is_unanswerable
 
@@ -217,3 +217,8 @@ class SQuAD2(Task):
             "best_exact": True,  # Best exact match (with varying threshold)
             "best_f1": True,  # Best F1 (with varying threshold)
         }
+
+class SQuAD(SQuAD2):
+    VERSION = 1
+    DATASET_PATH = "squad"
+    DATASET_NAME = None
